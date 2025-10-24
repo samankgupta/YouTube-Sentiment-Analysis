@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YouTube Comment Sentiment Analyzer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels"></script>
+</head>
+
+<body class="bg-gray-50 text-gray-800 min-h-screen flex flex-col items-center pt-16 p-6">
+    <!-- Header -->
+    <div class="flex flex-col items-center text-center space-y-6">
+        <div class="flex flex-col items-center space-y-4">
+            <img src="https://upload.wikimedia.org/wikipedia/commons/b/b8/YouTube_Logo_2017.svg" alt="YouTube Logo"
+                class="h-8 sm:h-10">
+            <h1 class="text-3xl sm:text-4xl font-semibold text-red-600">
+                Comment Sentiment Analyzer
+            </h1>
+        </div>
+
+        <p class="text-gray-800 max-w-4xl text-lg p-8">
+            Enter a YouTube video URL to analyze viewer sentiments from the comment section.
+            <br />This tool uses NLP models (VADER & TextBlob) to extract insights and highlight comment tone.
+        </p>
+    </div>
+
+    <!-- Search Bar -->
+    <form id="analyzeForm" class="mt-8 w-full max-w-md flex flex-col sm:flex-row gap-3">
+        <input id="videoUrl" name="video_url" type="url" placeholder="Paste YouTube video link..." required
+            class="flex-1 px-4 py-2 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-red-500" />
+        <button type="submit"
+            class="px-6 py-2 rounded-xl bg-red-600 text-white font-medium hover:bg-red-700 transition">
+            Analyze
+        </button>
+    </form>
+
+    <!-- Loader -->
+    <div id="loader" class="hidden mt-8 flex flex-col items-center">
+        <div class="w-10 h-10 border-4 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+        <p id="status" class="mt-3 text-gray-600">Analyzing comments... Please wait.</p>
+    </div>
+
+    <!-- Progress Bar -->
+    <div id="progress" class="hidden mt-4 text-gray-700 text-center w-full max-w-md">
+        <p id="progressText" class="text-sm"></p>
+        <div class="w-full bg-gray-200 rounded-full h-2 mt-2">
+            <div id="progressBar" class="bg-red-500 h-2 rounded-full" style="width: 0%"></div>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div id="results" class="hidden mt-10 w-full max-w-6xl space-y-6">
+        <div id="sentimentCounts" class="text-center"></div>
+
+        <!-- Pie chart -->
+        <div class="max-w-sm mx-auto">
+            <canvas id="sentimentChart"></canvas>
+        </div>
+
+        <div id="commentsTable" class="overflow-x-auto"></div>
+
+        <div class="text-center text-lg font-semibold mb-4">
+            Top Entities Mentioned
+        </div>
+        <div id="entities" class="mt-0 py-3 rounded-lg text-sm overflow-auto"></div>
+
+    </div>
+
+    <script>
+        const form = document.getElementById("analyzeForm");
+        const loader = document.getElementById("loader");
+        const progressDiv = document.getElementById("progress");
+        const progressText = document.getElementById("progressText");
+        const progressBar = document.getElementById("progressBar");
+        const status = document.getElementById("status");
+        const results = document.getElementById("results");
+        const sentimentCounts = document.getElementById("sentimentCounts");
+        const entitiesContainer = document.getElementById("entities");
+        const commentsTable = document.getElementById("commentsTable");
+
+        let chartInstance = null;
+
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const videoUrl = document.getElementById("videoUrl").value.trim();
+            if (!videoUrl) return;
+
+            // Regex to check YouTube URL formats
+            const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/)[\w-]{11}(&.*)?$/;
+
+            if (!youtubeRegex.test(videoUrl)) {
+                alert("Please enter a valid YouTube video URL!");
+                videoInput.focus();
+                return;
+            }
+
+            loader.classList.remove("hidden");
+            progressDiv.classList.remove("hidden");
+            results.classList.add("hidden");
+            progressBar.style.width = "0%";
+            progressText.textContent = "Starting analysis...";
+
+            try {
+                const response = await fetch("/progress", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ video_url: videoUrl })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let bufferedData = null;
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value);
+                    const matches = chunk.match(/data: (.*)\n\n/);
+                    if (matches) {
+                        bufferedData = JSON.parse(matches[1]);
+
+                        const progress = Math.round(bufferedData.progress);
+                        const eta = Math.round(bufferedData.eta);
+                        progressBar.style.width = `${progress}%`;
+                        progressText.textContent = `Progress: ${progress}% (~${eta}s remaining)`;
+
+                        if (bufferedData.stage === "done") {
+                            loader.classList.add("hidden");
+                            results.classList.remove("hidden");
+
+                            const result = bufferedData.result;
+                            const counts = result.sentiment_counts || {};
+                            const total = result.total_comments || 0;
+
+                            // Sentiment summary
+                            sentimentCounts.innerHTML = `
+                <p class="text-lg font-semibold mb-4">Total Comments Analyzed: 
+                  <span class="text-red-600">${total}</span>
+                </p>
+              `;
+              
+                            // Entities
+                            if (result && result.top_entities) {
+                                const entities = result.top_entities;
+
+                                const createTable = (label) => {
+                                    if (!entities[label] || entities[label].length === 0) return '';
+
+                                    let html = `<h4 class="mt-0 font-medium text-lg">${label} Entities</h4>`;
+                                    html += '<table class="w-full border-collapse border border-gray-300 mb-3">';
+                                    html += '<tr class="bg-gray-200"><th class="border border-gray-300 px-2 py-1">Entity</th><th class="border border-gray-300 px-2 py-1">Count</th></tr>';
+
+                                    // Only top 5
+                                    entities[label].slice(0, 5).forEach(([name, count]) => {
+                                        html += `<tr>
+                <td class="border border-gray-300 px-2 py-1 text-left">${name}</td>
+                <td class="border border-gray-300 px-2 py-1 text-left">${count}</td>
+             </tr>`;
+                                    });
+
+                                    html += '</table>';
+                                    return html;
+                                };
+
+                                entitiesContainer.innerHTML = createTable('Positive') + createTable('Negative');
+
+                            } else {
+                                entitiesContainer.innerHTML = "<p>No entities found.</p>";
+                            }
+                            
+                            // Pie chart
+                            const ctx = document.getElementById('sentimentChart').getContext('2d');
+                            if (chartInstance) chartInstance.destroy();
+
+                            chartInstance = new Chart(ctx, {
+                                type: 'pie',
+                                data: {
+                                    labels: ['Positive', 'Negative', 'Neutral'],
+                                    datasets: [{
+                                        data: [
+                                            counts.Positive || 0,
+                                            counts.Negative || 0,
+                                            counts.Neutral || 0
+                                        ],
+                                        backgroundColor: ['#16a34a', '#dc2626', '#facc15']
+                                    }]
+                                },
+                                options: {
+                                    responsive: true,
+                                    plugins: {
+                                        legend: { position: 'bottom' },
+                                        tooltip: { callbacks: { label: (ctx) => `${ctx.label}: ${ctx.raw}` } },
+                                        datalabels: {
+                                            display: true,
+                                            color: '#fff',
+                                            formatter: (value, ctx) => {
+                                                const dataArr = ctx.chart.data.datasets[0].data;
+                                                const sum = dataArr.reduce((a, b) => a + b, 0);
+                                                const percentage = sum ? ((value * 100) / sum).toFixed(2) + "%" : "0%";
+                                                return percentage;
+                                            }
+                                        }
+                                    }
+                                },
+                                plugins: [ChartDataLabels] // make sure ChartDataLabels is loaded globally
+                            });
+
+
+                            const pos = result.top_positive_comments || [];
+                            const neg = result.top_negative_comments || [];
+
+                            // Top comments table with hover tooltip for full text
+                            commentsTable.innerHTML = `
+                <div class="text-center text-lg font-semibold mb-4">
+                  Top 20 Positive & Negative Comments
+                </div>
+                <div class="overflow-x-auto">
+                  <table class="min-w-full border border-gray-300 bg-white text-sm">
+                    <thead class="bg-red-100">
+                      <tr>
+                        <th class="border border-gray-300 px-3 py-2 w-8">#</th>
+                        <th class="border border-gray-300 px-3 py-2 text-green-700 w-1/2">Positive Comments</th>
+                        <th class="border border-gray-300 px-3 py-2 text-red-700 w-1/2">Negative Comments</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${Array.from({ length: Math.max(pos.length, neg.length) }, (_, i) => `
+                        <tr class="hover:bg-gray-50">
+                          <td class="border border-gray-300 px-2 py-1 text-center">${i + 1}</td>
+                          <td class="border border-gray-300 px-3 py-2 max-w-[400px] truncate" title="${pos[i] || ""}">
+                            ${pos[i] || ""}
+                          </td>
+                          <td class="border border-gray-300 px-3 py-2 max-w-[400px] truncate" title="${neg[i] || ""}">
+                            ${neg[i] || ""}
+                          </td>
+                        </tr>
+                      `).join("")}
+                    </tbody>
+                  </table>
+                </div>
+              `;
+                        }
+                        else if(bufferedData.stage=="translating"){
+                            status.textContent = "Translating text to English..."
+                        }
+                        else if(bufferedData.stage == "downloading"){
+                            status.textContent = "Downloading comments..."
+                        }
+                        else if(bufferedData.stage == "sentiment_analysis"){
+                            status.textContent = "Analyzing Sentiment..."
+                        }
+                        else if (bufferedData.stage == "entity_extraction") {
+                            status.textContent = "Entity Extraction..."
+                        }
+                    }
+                }
+            } catch (err) {
+                loader.classList.add("hidden");
+                progressDiv.classList.add("hidden");
+                alert("Error analyzing the video. Please try again.");
+                console.error(err);
+            }
+        });
+    </script>
+</body>
+
+</html>
