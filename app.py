@@ -11,24 +11,24 @@ import urllib.request
 from youtube_comment_downloader import YoutubeCommentDownloader, SORT_BY_POPULAR
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from textblob import TextBlob
-from collections import defaultdict
+from collections import defaultdict, Counter
 from deep_translator import GoogleTranslator
-import nltk
 
-nltk.download("punkt")
-nltk.download("punkt_tab")
-nltk.download("averaged_perceptron_tagger")
-nltk.download("averaged_perceptron_tagger_eng")
-
-# ------------------ Setup ------------------
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# ------------------ Minimal NLTK setup (only what's necessary) ------------------
+# Downloading on startup is fine but in production you may want to do this in build step
 nltk.download("vader_lexicon", quiet=True)
+nltk.download("punkt", quiet=True)
+nltk.download("averaged_perceptron_tagger", quiet=True)
 
-nlp = spacy.load("en_core_web_sm")
+# ------------------ Setup models ------------------
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Use the small spaCy model (lighter & safer on limited hosts)
+nlp = spacy.load("en_core_web_sm", disable=[])  # keep default pipeline
 sia = SentimentIntensityAnalyzer()
 downloader = YoutubeCommentDownloader()
 
-# Load FastText model once
+# Load FastText model once at startup (downloads if missing)
 FT_MODEL_PATH = "lid.176.ftz"
 if not os.path.exists(FT_MODEL_PATH):
     urllib.request.urlretrieve(
@@ -40,36 +40,50 @@ FT_MODEL = fasttext.load_model(FT_MODEL_PATH)
 app = Flask(__name__)
 
 # ------------------ Helpers ------------------
-def translate_text(text):
-    """Translate text to English safely."""
-    try:
-        return GoogleTranslator(source='auto', target='en').translate(text)
-    except Exception:
-        return text
-
 def clean_text_simple(text):
+    """Normalize whitespace and coerce to str."""
     return re.sub(r"\s+", " ", str(text)).strip()
 
 def detect_language(text):
+    """Safely detect language using FT_MODEL. Returns '__label__xx' or '__label__en' on error."""
     try:
-        if not text or not isinstance(text, str) or len(text.strip()) == 0:
+        if not text or not isinstance(text, str) or not text.strip():
             return "__label__en"
-        text = text.strip().replace("\n", " ")
-        if len(text) > 5000:
-            text = text[:5000]
-        result = FT_MODEL.predict(text)
-        return result[0][0]
-    except Exception:
+        s = text.strip().replace("\n", " ")
+        if len(s) > 5000:
+            s = s[:5000]
+        res = FT_MODEL.predict(s)
+        # fasttext.predict typically returns (['__label__xx'], array([prob]))
+        if isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], (list, tuple)) and len(res[0]) >= 1:
+            return res[0][0]
+        # sometimes returns list-of-lists, try to be defensive:
+        if isinstance(res, list) and len(res) and isinstance(res[0], (list, tuple)):
+            return res[0][0]
         return "__label__en"
+    except Exception as e:
+        # Log quickly — avoid crashing
+        print("detect_language error:", e)
+        return "__label__en"
+
+def translate_text(text):
+    """Translate text to English using deep-translator; fallback to original on error."""
+    try:
+        return GoogleTranslator(source="auto", target="en").translate(text)
+    except Exception as e:
+        print("translate_text error:", e)
+        return text
 
 def translate_comments_generator(text_series, translate_limit=None):
     """
-    Generator to translate comments with progress updates.
-    Yields dicts: {"progress", "eta", "stage"}
-    Returns list of translated texts via StopIteration.value
+    Generator that translates comment texts in text_series.
+    Yields dictionary progress updates (JSON-serializable).
+    Returns list of translated strings via StopIteration.value.
     """
     start = time.time()
     n_total = len(text_series)
+    if n_total == 0:
+        return []
+
     n = n_total if translate_limit is None else min(n_total, translate_limit)
     translated = []
 
@@ -83,17 +97,19 @@ def translate_comments_generator(text_series, translate_limit=None):
             if lang_label == "en":
                 translated.append(t_clean)
             else:
-                translated.append(translate_text(t_clean))
+                # sync translation (deep-translator)
+                translated.append(clean_text_simple(translate_text(t_clean)))
 
-        # emit periodic progress updates (every 30 items or last item)
+        # emit progress updates every 30 items or at the end
         if (i + 1) % 30 == 0 or (i + 1) == n:
             elapsed = time.time() - start
             avg = elapsed / (i + 1) if (i + 1) > 0 else 0
             eta = int((n - (i + 1)) * avg + 5)
-            progress = 50 + min(int(((i + 1) / n_total) * 30), 30)  # map translate phase to 50-80%
+            # map translate phase to 50..80
+            progress = 50 + min(int(((i + 1) / n_total) * 30), 30)
             yield {"progress": progress, "eta": eta, "stage": "translating"}
 
-    # fill remaining texts if translate_limit < total
+    # If translation limited, append cleaned originals for remainder
     if n < n_total:
         for j in range(n, n_total):
             translated.append(clean_text_simple(text_series.iloc[j]))
@@ -101,6 +117,7 @@ def translate_comments_generator(text_series, translate_limit=None):
     return translated
 
 def ensure_text_column(df):
+    """Ensure df has a text column of strings."""
     if "text" not in df.columns:
         df["text"] = ""
     df["text"] = df["text"].fillna("").astype(str)
@@ -108,7 +125,7 @@ def ensure_text_column(df):
 def vader_sentiment(df):
     ensure_text_column(df)
     def to_label(text):
-        if not text.strip():
+        if not text or not text.strip():
             return "Neutral"
         try:
             score = sia.polarity_scores(text)["compound"]
@@ -126,7 +143,7 @@ def vader_sentiment(df):
 def textblob_sentiment(df):
     ensure_text_column(df)
     def to_label(text):
-        if not text.strip():
+        if not text or not text.strip():
             return "Neutral"
         try:
             p = TextBlob(text).sentiment.polarity
@@ -149,20 +166,57 @@ def final_sentiment(df):
     return df
 
 def extract_entities(df):
-    sentnames = defaultdict(lambda: defaultdict(int))
+    """
+    Efficient & safe entity extraction:
+    - uses nlp.pipe for batching
+    - counts PERSON and ORG mentions grouped by Final_Sentiment
+    """
     ensure_text_column(df)
-    for _, row in df.iterrows():
-        text = row["text"]
-        if not text:
-            continue
-        try:
-            doc = nlp(text)
-        except Exception:
-            continue
-        for ent in doc.ents:
-            if ent.label_ == "PERSON" or ent.label_ == "ORG":
-                sentnames[row["Final_Sentiment"]][ent.text] += 1
-    return {cat: sorted(names.items(), key=lambda kv: kv[1], reverse=True)[:10] for cat, names in sentnames.items()}
+    # prepare counters
+    counters = defaultdict(Counter)  # counters[sentiment][entity] = count
+
+    texts = df["text"].tolist()
+    sentiments = df["Final_Sentiment"].tolist() if "Final_Sentiment" in df.columns else ["Neutral"] * len(texts)
+
+    # Use nlp.pipe to process in batches; catch exceptions per doc
+    try:
+        for doc, sentiment in zip(nlp.pipe(texts, batch_size=32), sentiments):
+            if doc is None:
+                continue
+            try:
+                for ent in doc.ents:
+                    if ent.label_ in ("PERSON", "ORG"):
+                        # normalize entity text a bit
+                        name = ent.text.strip()
+                        if name:
+                            counters[sentiment][name] += 1
+            except Exception as e:
+                # continue on per-doc parse errors
+                print("entity parse error:", e)
+                continue
+    except Exception as e:
+        # if nlp.pipe raises globally, fall back to per-doc safe loop
+        print("nlp.pipe error:", e)
+        for text, sentiment in zip(texts, sentiments):
+            if not text:
+                continue
+            try:
+                doc = nlp(text)
+                for ent in doc.ents:
+                    if ent.label_ in ("PERSON", "ORG"):
+                        name = ent.text.strip()
+                        if name:
+                            counters[sentiment][name] += 1
+            except Exception as e2:
+                print("fallback entity error:", e2)
+                continue
+
+    # Convert counters to sorted list of tuples (top 10)
+    result = {
+        sentiment: sorted(counter.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        for sentiment, counter in counters.items()
+    }
+    return result
 
 # ------------------ Flask routes ------------------
 @app.route("/")
@@ -176,11 +230,11 @@ def progress():
         return Response(json.dumps({"error": "no video_url"}), status=400, mimetype="application/json")
 
     def generate():
-        # Step 1: download comments
+        # Step 1: download comments (streaming progress)
         comments = []
         count = 0
         start = time.time()
-        MAX_COMMENTS = 4000
+        MAX_COMMENTS = 4000  # adjust if you want fewer
 
         for comment in downloader.get_comments_from_url(video_url, sort_by=SORT_BY_POPULAR):
             comments.append(comment)
@@ -188,8 +242,8 @@ def progress():
             if count % 30 == 0:
                 elapsed = time.time() - start
                 avg_time = elapsed / count if count > 0 else 0
-                eta = max(0, int(((MAX_COMMENTS - count) * avg_time) + 100))
-                progress = min(int((count / MAX_COMMENTS) * 50), 50)
+                eta = max(0, int(((MAX_COMMENTS - count) * avg_time) + 10))
+                progress = min(int((count / MAX_COMMENTS) * 50), 50)  # map to 0-50
                 yield f"data: {json.dumps({'progress': progress, 'eta': eta, 'stage': 'downloading'})}\n\n"
             if count >= MAX_COMMENTS:
                 break
@@ -199,16 +253,18 @@ def progress():
             yield f"data: {json.dumps({'progress': 100, 'eta': 0, 'stage': 'done', 'result': {'error': 'No comments found'}})}\n\n"
             return
 
-        # Step 2: translation phase
+        # Step 2: translation phase (stream progress)
         translate_gen = translate_comments_generator(df["text"])
         while True:
             try:
                 upd = next(translate_gen)
+                # upd is a JSON-serializable dict
                 yield f"data: {json.dumps(upd)}\n\n"
             except StopIteration as e:
                 translated_list = e.value
                 break
 
+        # replace texts with translations
         df = df.copy()
         df["text"] = translated_list
 
@@ -218,11 +274,11 @@ def progress():
         df = textblob_sentiment(df)
         df = final_sentiment(df)
 
-        # Step 4: entity extraction
+        # Step 4: entity extraction (progress update)
         yield f"data: {json.dumps({'progress': 90, 'eta': 5, 'stage': 'entity_extraction'})}\n\n"
         entities_data = extract_entities(df)
 
-        # Step 5: final result
+        # Step 5: prepare final result
         sentiment_counts = df["Final_Sentiment"].value_counts().to_dict()
         total_comments = len(df)
         top_positive = df[df["Final_Sentiment"] == "Positive"]["text"].head(20).tolist()
