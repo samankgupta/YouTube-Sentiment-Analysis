@@ -13,6 +13,12 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from textblob import TextBlob
 from collections import defaultdict
 from deep_translator import GoogleTranslator
+import nltk
+
+nltk.download("punkt")
+nltk.download("punkt_tab")
+nltk.download("averaged_perceptron_tagger")
+nltk.download("averaged_perceptron_tagger_eng")
 
 # ------------------ Setup ------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
