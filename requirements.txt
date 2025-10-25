@@ -19,6 +19,7 @@ en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_
 fasttext==0.9.3
 Flask==3.1.2
 fonttools==4.60.1
+gunicorn
 h11==0.9.0
 h2==3.2.0
 hpack==3.0.0
